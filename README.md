@@ -24,3 +24,7 @@ Each json has the following keys/columns:
 * "-1": Don't know why this column is here
 
 See read_dataset(path) in compute_ue.py for an example of loading one of the json files into a pandas DataFrame.
+
+Original Paper and Code for Paper:
+https://arxiv.org/abs/2410.22071
+https://github.com/technion-cs-nlp/hallucination-mitigation/tree/main/Distinguishing_Ignorance_from_Error_in_LLM_Hallucinations
