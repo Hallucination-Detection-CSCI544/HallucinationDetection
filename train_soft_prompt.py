@@ -6,6 +6,8 @@ import pandas as pd
 from dataclasses import dataclass
 from typing import Dict, List
 from peft import PeftModel
+import random 
+from sklearn.model_selection import train_test_split
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -18,49 +20,64 @@ from transformers import (
 )
 import numpy as np
 from peft import PromptTuningConfig, PromptTuningInit, get_peft_model
-def read_dataset(path):
-    with open(path, "r") as f:
-        data = json.load(f)
-    cols = [
-        
-        "clean_prompt", "golden_answer", "wrong_answer",
-        "golden_answer_token", "wrong_answer_token",
-        "prompt_with_bad_shots/alice", "count_knowledge", "-1"
-    ]
-    df = pd.DataFrame(data, columns=cols).head(50)
-    print(df.head(1))
-    return df
-alice_path = "datasets/AliceHallucinateTrivia_qa_no_contextWithThreshold1.0_mistralai_Mistral-7B-v0.3.json"
-snowball_path = "datasets/HallucinateTrivia_qa_no_contextWithThreshold1.0_mistralai_Mistral-7B-v0.3.json"
-alice_path_nat = "datasets/AliceHallucinateNatural_qa_no_contextWithThreshold1.0_mistralai_Mistral-7B-v0.3.json"
-snowball_path_nat = "datasets/HallucinateNatural_qa_no_contextWithThreshold1.0_mistralai_Mistral-7B-v0.3.json"
-alice_df = read_dataset(alice_path)
-snowball_df = read_dataset(snowball_path)
-alice_df_nat = read_dataset(alice_path_nat)
-snowball_df_nat = read_dataset(snowball_path_nat)
-alice_df["condition"] = "alice-trivia"
-snowball_df["condition"] = "snowball-trivia"
-alice_df_nat["condition"] = "alice-natural"
-snowball_df_nat["condition"] = "snowball-natural"
-print(f"Number of alice trivia samples: {len(alice_df)}")
-print(f"Number of snowball trivia samples: {len(snowball_df)}")
-print(f"Number of alice natural samples: {len(alice_df_nat)}")
-print(f"Number of snowball natural samples: {len(snowball_df_nat)}")
-df = pd.concat([alice_df, snowball_df, alice_df_nat, snowball_df_nat], ignore_index=True)
-df = df[["prompt_with_bad_shots/alice", "golden_answer", "condition"]]
-print(f"Total samples: {len(df)}")
-df = df.rename(columns={'prompt_with_bad_shots/alice': 'prompt', 'golden_answer': 'answer'})
 
-MODEL_NAME = "mistralai/Mistral-7B-v0.3"
+SEED = 42
+LABEL2ID = {"Factually Correct": 0, "HK+": 1, "HK-": 2}
+TEST_SIZE = 0.1        
+VAL_SIZE = 0.1  
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+with open("wack_dataset.json", "r") as f:
+    raw_dataset = [ex for ex in json.load(f) if ex.get("label") in LABEL2ID]
+
+labels = np.array([LABEL2ID[ex["label"]] for ex in raw_dataset], dtype=np.int64)
+all_indices = np.arange(len(raw_dataset))
+trainval_idx, test_idx = train_test_split(
+    all_indices,
+    test_size=TEST_SIZE,
+    stratify=labels,
+    random_state=SEED
+)
+
+train_idx, val_idx = train_test_split(
+    trainval_idx,
+    test_size=VAL_SIZE,
+    stratify=labels[trainval_idx],
+    random_state=SEED
+)
+
+train_df = []
+val_df = []
+test_df = []
+for i in train_idx:
+    ex = raw_dataset[i]
+    if ex["label"] == "HK+":
+        train_df.append({"prompt": ex["prompt"], "answer": ex["real_answer"]})
+for i in val_idx:
+    ex = raw_dataset[i]
+    if ex["label"] == "HK+":
+        val_df.append({"prompt": ex["prompt"], "answer": ex["real_answer"]})
+for i in test_idx:
+    ex = raw_dataset[i]
+    if ex["label"] == "HK+":
+        test_df.append({"prompt": ex["prompt"], "answer": ex["real_answer"]})
+        
+train_df = pd.DataFrame(train_df)
+dev_df = pd.DataFrame(val_df)
+test_df = pd.DataFrame(test_df)
+
+MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
 OUTPUT_DIR = "./soft_prompt_mistral_qa"
 TEST_OUTPUT_CSV = os.path.join(OUTPUT_DIR, "test_outputs.csv")
 
-NUM_VIRTUAL_TOKENS = 20         # soft prompt length
+NUM_VIRTUAL_TOKENS = 10         # soft prompt length
 LR = 5e-3                      
 WEIGHT_DECAY = 0.0
 NUM_EPOCHS = 10
 GRAD_ACCUM_STEPS = 16          
-PATIENCE = 2                    
+PATIENCE = 2               
 WARMUP_RATIO = 0.03
 SEED = 1337
 DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
@@ -69,29 +86,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 set_seed(SEED)
 BEST_ADAPTER_DIR = os.path.join(OUTPUT_DIR, "best_adapter")
 
-
-def stratified_split(df, label_col="condition", train_frac=0.8, dev_frac=0.1, test_frac=0.1, seed=SEED):
-    assert abs(train_frac + dev_frac + test_frac - 1.0) < 1e-6
-    rng = random.Random(seed)
-    parts = []
-    for label, g in df.groupby(label_col):
-        idx = list(g.index)
-        rng.shuffle(idx)
-        n = len(idx)
-        n_train = int(train_frac * n)
-        n_dev = int(dev_frac * n)
-        train_idx = idx[:n_train]
-        dev_idx = idx[n_train:n_train+n_dev]
-        test_idx = idx[n_train+n_dev:]
-        parts.append((train_idx, dev_idx, test_idx))
-    train_idx = [i for p in parts for i in p[0]]
-    dev_idx   = [i for p in parts for i in p[1]]
-    test_idx  = [i for p in parts for i in p[2]]
-    return df.loc[train_idx].reset_index(drop=True), \
-           df.loc[dev_idx].reset_index(drop=True), \
-           df.loc[test_idx].reset_index(drop=True)
-
-train_df, dev_df, test_df = stratified_split(df, "condition")
 
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
@@ -121,18 +115,20 @@ model.train()
 # Only soft prompt params should be trainable
 trainable_params = [p for p in model.parameters() if p.requires_grad]
 print("Trainable parameter count:", sum(p.numel() for p in trainable_params))
+print(f"Number of training samples: {len(train_df)}")
+print(f"Number of validation samples: {len(dev_df)}")
+print(f"Number of testing samples: {len(test_df)}")
 
 
 @dataclass
 class QADatum:
     prompt: str
     answer: str
-    condition: str
 
 class QADataset(Dataset):
     def __init__(self, df: pd.DataFrame):
         self.data = [
-            QADatum(row.prompt, row.answer, row.condition)
+            QADatum(row.prompt, row.answer)
             for row in df.itertuples(index=False)
         ]
 
@@ -155,7 +151,6 @@ def qa_collate(batch: List[QADatum]) -> Dict[str, torch.Tensor]:
         "labels": torch.tensor([labels], dtype=torch.long),
         "prompt": ex.prompt,
         "answer": ex.answer,
-        "condition": ex.condition,
     }
 
 train_loader = DataLoader(QADataset(train_df), batch_size=1, shuffle=True, collate_fn=qa_collate)
@@ -217,7 +212,7 @@ for epoch in range(NUM_EPOCHS):
         tokenizer.save_pretrained(BEST_ADAPTER_DIR)
     else:
         patience_left -= 1
-        print(f"  ✗ No improvement. Patience left: {patience_left}")
+        print(f"No improvement. Patience left: {patience_left}")
         if patience_left <= 0:
             print("Early stopping.")
             break
@@ -247,32 +242,20 @@ def generate_answer(prompt: str, max_new_tokens=10):
     
     return out
 
-results_alice_trivia = []
-results_snowball_trivia = []
-results_alice_nat = []
-results_snowball_nat = []
 
+results = []
 rows = []
 for batch in test_loader:
     prompt = batch["prompt"]
-    cond = batch["condition"]
     gt = batch["answer"]
     out = generate_answer(prompt)
     if gt.lower() in out.lower():
         r = 1.0
     else:
         r = 0.0
-    if cond == "alice-trivia":
-        results_alice_trivia.append(r)
-    elif cond == "alice-natural":
-        results_alice_nat.append(r)
-    elif cond == "snowball-trivia":
-        results_snowball_trivia.append(r)
-    else:
-        results_snowball_nat.append(r)
+    results.append(r)
     rows.append({
         "prompt": prompt,
-        "condition": cond,
         "ground_truth": gt,
         "output": out,
     })
@@ -281,8 +264,4 @@ out_df = pd.DataFrame(rows)
 out_df.to_csv(TEST_OUTPUT_CSV, index=False)
 print(f"Saved test generations -> {TEST_OUTPUT_CSV}")
 
-print(f"Average QA accuracy on alice trivia: {np.mean(results_alice_trivia)}")
-print(f"Average QA accuracy on alice natural: {np.mean(results_alice_nat)}")
-print(f"Average QA accuracy on snowball trivia: {np.mean(results_snowball_trivia)}")
-print(f"Average QA accuracy on snowball natural: {np.mean(results_snowball_nat)}")
-print(f"Average QA accuracy total: {np.mean(results_alice_trivia + results_alice_nat + results_snowball_trivia + results_snowball_nat)}")
+print(f"Average QA accuracy: {np.mean(results)}")

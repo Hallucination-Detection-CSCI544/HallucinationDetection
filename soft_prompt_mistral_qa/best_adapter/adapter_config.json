@@ -1,12 +1,12 @@
 {
   "auto_mapping": null,
-  "base_model_name_or_path": "mistralai/Mistral-7B-v0.3",
+  "base_model_name_or_path": "mistralai/Mistral-7B-Instruct-v0.3",
   "inference_mode": true,
   "modules_to_save": null,
   "num_attention_heads": 32,
   "num_layers": 32,
   "num_transformer_submodules": 1,
-  "num_virtual_tokens": 20,
+  "num_virtual_tokens": 10,
   "peft_type": "PROMPT_TUNING",
   "peft_version": "0.18.0",
   "prompt_tuning_init": "TEXT",
@@ -15,5 +15,5 @@
   "task_type": "CAUSAL_LM",
   "token_dim": 4096,
   "tokenizer_kwargs": null,
-  "tokenizer_name_or_path": "mistralai/Mistral-7B-v0.3"
+  "tokenizer_name_or_path": "mistralai/Mistral-7B-Instruct-v0.3"
 }
