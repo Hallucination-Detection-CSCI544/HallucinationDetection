@@ -72,3 +72,4 @@ class RAGPipeline:
             "answer": str(answer),
             "sources": docs
         }
+
