@@ -9,7 +9,7 @@ import uuid
 def build_rag_store(
         n: int = 1000,
         output_folder: str = "rag_triviaqa_store",
-        embeddings_model_name: str = "mistralai/Mistral-Embed"
+        embeddings_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
         ) -> None:
 
     if os.path.exists(output_folder):
@@ -44,7 +44,7 @@ def build_rag_store(
 
     for q_idx, row in enumerate(dataset):
         question_id = q_idx
-        
+
         entity_pages = row.get("entity_pages", {})
         search_results = row.get("search_results", {})
 
