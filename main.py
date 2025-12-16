@@ -9,70 +9,47 @@ from pathlib import Path
 import pickle
 from peft import PeftModel
 import numpy as np
+from probe import Probe
 
-# -------------------------------
-# 1. Build RAG datastore (only if run directly)
-# -------------------------------
+# Build RAG datastore 
 if __name__ == "__main__":
-    # This will now check if folder exists before rebuilding (see wack_to_vec change)
-    build_rag_store()
+    # This will check if folder exists before rebuilding 
+    build_rag_store(n=10)
 
-# -------------------------------
-# 2. Configuration
-# -------------------------------
-PROBE_PATH = "./hallucination_probe.pkl"
-SOFT_PROMPT_PATH = "./soft_prompt_mistral_qa/best_adapter"
+# Configuration
 MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
+PROBE_PATH = "./checkpoints/probe.pt"
+SOFT_PROMPT_PATH = "./soft_prompt_mistral_qa/best_adapter"
 
-# --------------------------------
-# 3. Load probe
-# --------------------------------
-if Path(PROBE_PATH).exists():
-    with open(PROBE_PATH, 'rb') as f:
-        probe_data = pickle.load(f)
-        probe_classifier = probe_data['classifier']
-        probe_scaler = probe_data['scaler']
-    print("Probe loaded successfully.")
-else:
-    # Fallback for testing without probe
-    print("WARNING: Probe not found. Mocking probe for testing.")
-    probe_classifier = None
-    probe_scaler = None
 
-# -------------------------------
-# 4. Load shared main LLM
-# -------------------------------
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_quant_type="nf4",
-)
-
-print("Loading main LLM (shared)...")
-shared_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# Load shared main LLM
+shared_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 shared_tokenizer.pad_token_id = shared_tokenizer.eos_token_id
+shared_tokenizer.padding_side = "right"
 
 shared_model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
-    quantization_config=bnb_config,
-    device_map="auto"
-)
+    torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+).to(DEVICE)
+shared_model.eval()
+for p in shared_model.parameters():
+    p.requires_grad = False
 
-# -------------------------------
-# 5. Initialize RAG pipeline
-# -------------------------------
+ckpt = torch.load(PROBE_PATH)
+probe_classifier = Probe(shared_model.config.hidden_size)
+probe_classifier.load_state_dict(ckpt['model_state_dict'])
+
+# Initialize RAG pipeline
 rag_pipeline = RAGPipeline(
     model=shared_model,
     tokenizer=shared_tokenizer,
-    embeddings_model_name="mistralai/Mistral-Embed",
+    embeddings_model_name="sentence-transformers/all-MiniLM-L6-v2",
     vectorstore_folder="rag_triviaqa_store",
-    top_k=5
+    top_k=3
 )
 
-# -------------------------------
-# 6. Load soft prompt
-# -------------------------------
+# Load soft prompt
 if Path(SOFT_PROMPT_PATH).exists():
     soft_prompt_model = PeftModel.from_pretrained(
         shared_model,
@@ -85,30 +62,26 @@ else:
     soft_prompt_model = None
     print("Warning: Soft prompt not found. HK+/- will use base model.")
 
-# -------------------------------
-# 7. Pipeline functions
-# -------------------------------
+# Pipeline functions
 def call_main_llm(input_dict: dict) -> dict:
     """
     Call base LLM to get the hidden state of the prompt.
     We also generate a short answer here, which we might use if it's 'Factually Correct'.
     """
     query = input_dict if isinstance(input_dict, str) else input_dict["query"]
-    
-    inputs = shared_tokenizer(query, return_tensors="pt").to(DEVICE)
+    inputs = shared_tokenizer(f"question: {query}\nanswer: ", return_tensors="pt").to(DEVICE)
     
     with torch.no_grad():
-        # Get hidden states for the PROMPT (last token of input)
-        outputs = shared_model(**inputs, output_hidden_states=True)
-        last_hidden_state = outputs.hidden_states[-1][0, -1, :].cpu()
         
         # Generate prediction (Base Model)
         generated_ids = shared_model.generate(
             inputs["input_ids"],
-            max_new_tokens=64,
+            max_new_tokens=10,
             pad_token_id=shared_tokenizer.eos_token_id,
-            do_sample=True
+            do_sample=False
         )
+        outputs = shared_model(input_ids=generated_ids, output_hidden_states=True)
+        x = torch.stack([h[0, -1, :] for h in outputs.hidden_states], dim=0).unsqueeze(0)  # [1, L, D]
         
     llm_output = shared_tokenizer.decode(generated_ids[0], skip_special_tokens=True)
     
@@ -119,20 +92,16 @@ def call_main_llm(input_dict: dict) -> dict:
     return {
         'query': query, 
         'llm_output': llm_output, 
-        'hidden_state': last_hidden_state
+        'hidden_state': x.float().cpu()
     }
 
 def classify_uncertainty(hidden_state) -> str:
     """
     3-way classification using the hidden state vector.
     """
-    if probe_classifier is None: 
-        return "HK-" # Default to RAG if no probe
+    logits = probe_classifier(hidden_state)
+    pred = int(logits.argmax(-1).item())
 
-    # Ensure shape is (1, hidden_dim)
-    hidden_np = hidden_state.numpy().reshape(1, -1)
-    hidden_scaled = probe_scaler.transform(hidden_np)
-    pred = probe_classifier.predict(hidden_scaled)[0]
     
     mapping = {0: "Factually Correct", 1: "HK+", 2: "HK-"}
     result = mapping.get(pred, "HK-")
@@ -142,30 +111,29 @@ def classify_uncertainty(hidden_state) -> str:
 def call_prompt_expert(query: str) -> str:
     """Call soft prompt model for HK+ queries."""
     model_to_use = soft_prompt_model if soft_prompt_model else shared_model
-    inputs = shared_tokenizer(query, return_tensors="pt").to(DEVICE)
+    inputs = shared_tokenizer(f"question: {query}\nanswer: ", return_tensors="pt").to(DEVICE)
     with torch.no_grad():
         generated_ids = model_to_use.generate(
             inputs["input_ids"],
-            max_new_tokens=64,
-            pad_token_id=shared_tokenizer.eos_token_id
+            max_new_tokens=10,
+            pad_token_id=shared_tokenizer.eos_token_id,
+            do_sample=False
         )
-    answer = shared_tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-    if answer.startswith(query):
-        answer = answer[len(query):].strip()
+    new_tokens = generated_ids[0, inputs['input_ids'].shape[1]:]
+    answer = shared_tokenizer.decode(new_tokens, skip_special_tokens=True)
+    
+
     return f"[Soft Prompt] {answer}"
 
 def rag_retrieve_answer(query: str) -> str:
     print("Routing to RAG...")
     return f"[RAG] {rag_pipeline.query(query)['answer']}"
 
-# -------------------------------
-# 8. LCEL Pipeline Definition
-# -------------------------------
 
 # Step 1: Run base model to get hidden states and initial answer
 step_1_generation = RunnableLambda(call_main_llm)
 
-# Step 2: Classify based on the HIDDEN STATE (not query), add label to dict
+# Step 2: Classify based on the hidden states, add label to dict
 def labeling_step(x):
     label = classify_uncertainty(x["hidden_state"])
     return {**x, "hk_label": label}
@@ -188,12 +156,9 @@ decision_branch = RunnableBranch(
 # Composition
 full_chain = step_1_generation | step_2_labeling | decision_branch
 
-# -------------------------------
-# 9. Execution Example
-# -------------------------------
+# Execution Example
 if __name__ == "__main__":
-    # Test query
-    test_query = "Who won the Super Bowl in 1998?"
+    test_query = "Which Lloyd Webber musical premiered in the US on 10th December 1993?"
     print(f"Query: {test_query}")
     
     try:

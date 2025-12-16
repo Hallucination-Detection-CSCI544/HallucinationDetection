@@ -4,7 +4,10 @@ from langchain_huggingface import HuggingFacePipeline
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from transformers import pipeline
+from langchain_core.runnables import RunnableLambda
 
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
 
 class RAGPipeline:
     def __init__(
@@ -45,18 +48,18 @@ class RAGPipeline:
             temperature=temperature,
             do_sample=do_sample,
             top_p=top_p,
-            return_full_text=False
+            return_full_text=False,
         )
 
         self.llm = HuggingFacePipeline(pipeline=pipe)
 
         # Prompt
-        self.prompt = ChatPromptTemplate.from_template("context: {context}\nquestion: {input}\nanswer:")
+        self.prompt = ChatPromptTemplate.from_template("answer according to the context in one or two words. context: {context}\nquestion: {input}\nanswer:")
 
         # LCEL RAG chain
         self.chain = (
             {
-                "context": self.retriever,
+                "context": self.retriever | RunnableLambda(format_docs),
                 "input": RunnablePassthrough()
             }
             | self.prompt
@@ -67,7 +70,8 @@ class RAGPipeline:
         answer = self.chain.invoke(text)
 
         docs = self.retriever.invoke(text)
-
+        doc_txt = "\n\n".join(doc.page_content for doc in docs)
+        print(f"Docs retrieved: {doc_txt}")
         return {
             "answer": str(answer),
             "sources": docs
